@@ -1540,6 +1540,20 @@ proc blendLineMask(
   for i in 0 ..< len:
     line[i] = blendMask(line[i], rgbx)
 
+iterator walkIntegerClipped(
+  hits: seq[(Fixed32, int16)],
+  numHits: int,
+  windingRule: WindingRule,
+  y, clipMinX, clipMaxX: int
+): (int, int) =
+  ## Spans of a scanline that are both inside the path and inside the clip.
+  for (start, len) in hits.walkInteger(numHits, windingRule, y, clipMaxX):
+    let
+      clippedStart = max(start, clipMinX)
+      clippedLen = start + len - clippedStart
+    if clippedLen > 0:
+      yield (clippedStart, clippedLen)
+
 proc fillHits(
   image: Image,
   rgbx: ColorRGBX,
@@ -1548,15 +1562,20 @@ proc fillHits(
   numHits: int,
   windingRule: WindingRule,
   blendMode: BlendMode,
+  clipMinX, clipMaxX: int,
   maskClears = true
 ) =
   case blendMode:
   of OverwriteBlend:
-    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+    for (start, len) in hits.walkIntegerClipped(
+      numHits, windingRule, y, clipMinX, clipMaxX
+    ):
       fillUnsafe(image.data, rgbx, image.dataIndex(start, y), len)
 
   of NormalBlend:
-    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+    for (start, len) in hits.walkIntegerClipped(
+      numHits, windingRule, y, clipMinX, clipMaxX
+    ):
       if rgbx.a == 255:
         fillUnsafe(image.data, rgbx, image.dataIndex(start, y), len)
       else:
@@ -1564,8 +1583,10 @@ proc fillHits(
 
   of MaskBlend:
     {.linearScanEnd.}
-    var filledTo = startX
-    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+    var filledTo = max(startX, clipMinX)
+    for (start, len) in hits.walkIntegerClipped(
+      numHits, windingRule, y, clipMinX, clipMaxX
+    ):
       if maskClears: # Clear any gap between this fill and the previous fill
         let gapBetween = start - filledTo
         if gapBetween > 0:
@@ -1581,46 +1602,67 @@ proc fillHits(
         filledTo = start + len
 
     if maskClears:
-      image.clearUnsafe(0, y, startX, y)
-      image.clearUnsafe(filledTo, y, image.width, y)
+      image.clearUnsafe(clipMinX, y, max(startX, clipMinX), y)
+      image.clearUnsafe(filledTo, y, clipMaxX, y)
 
   else:
     let blender = blendMode.blender()
-    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+    for (start, len) in hits.walkIntegerClipped(
+      numHits, windingRule, y, clipMinX, clipMaxX
+    ):
       var dataIndex = image.dataIndex(start, y)
       for _ in 0 ..< len:
         let backdrop = image.data[dataIndex]
         image.data[dataIndex] = blender(backdrop, rgbx)
         inc dataIndex
 
+proc clipWindow(image: Image, clip: Rect): tuple[minX, minY, maxX, maxY: int] =
+  ## The pixels a fill is allowed to touch: the clip rectangle intersected with
+  ## the image. A zero-size clip means unclipped, matching how an omitted
+  ## `bounds` is spelled elsewhere in the library.
+  if clip.w <= 0 or clip.h <= 0:
+    result = (0, 0, image.width, image.height)
+  else:
+    let snapped = clip.snapToPixels()
+    result = (
+      clamp(snapped.x.int, 0, image.width),
+      clamp(snapped.y.int, 0, image.height),
+      clamp((snapped.x + snapped.w).int, 0, image.width),
+      clamp((snapped.y + snapped.h).int, 0, image.height)
+    )
+
 proc fillShapes(
   image: Image,
   shapes: seq[Polygon],
   color: SomeColor,
   windingRule: WindingRule,
-  blendMode: BlendMode
+  blendMode: BlendMode,
+  clip = rect(0, 0, 0, 0)
 ) =
-  # Figure out the total bounds of all the shapes,
-  # rasterize only within the total bounds
+  # Figure out the total bounds of all the shapes, then rasterize only within
+  # those bounds intersected with the clip window. Every write below stays
+  # inside the window, so a path that reaches outside the image or outside the
+  # clip costs nothing and touches nothing.
   let
     rgbx = color.asRgbx()
     segments = shapes.shapesToSegments()
     bounds = computeBounds(segments).snapToPixels()
-    startX = max(0, bounds.x.int)
-    startY = clamp(bounds.y.int, 0, image.height)
+    window = image.clipWindow(clip)
+    startX = max(window.minX, bounds.x.int)
+    startY = clamp(bounds.y.int, window.minY, window.maxY)
     pathWidth =
-      if startX < image.width:
-        min(bounds.w.int, image.width - startX)
+      if startX < window.maxX:
+        min(bounds.w.int, window.maxX - startX)
       else:
         0
-    pathHeight = clamp((bounds.y + bounds.h).int, 0, image.height)
+    pathHeight = clamp((bounds.y + bounds.h).int, window.minY, window.maxY)
 
   if pathWidth == 0:
     if blendMode == MaskBlend:
-      # The path is entirely outside the image horizontally, so nothing is
+      # The path does not intersect the window horizontally, so nothing is
       # inside it. A mask fill still needs to record that, otherwise the
       # previous mask survives and the new clip has no effect.
-      image.clearUnsafe(0, 0, 0, image.height)
+      image.clearUnsafe(window.minX, window.minY, window.minX, window.maxY)
     return
 
   if pathWidth < 0:
@@ -1655,13 +1697,14 @@ proc fillShapes(
         let
           left = partition.entries[0].segment.at.x.int
           right = partition.entries[1].segment.at.x.int
-          minX = left.clamp(0, image.width)
-          maxX = right.clamp(0, image.width)
+          minX = left.clamp(window.minX, window.maxX)
+          maxX = right.clamp(window.minX, window.maxX)
           skipBlending =
             blendMode == OverwriteBlend or
             (blendMode == NormalBlend and rgbx.a == 255)
         if skipBlending and minX == 0 and maxX == image.width:
-          # We can be greedy, just do one big mult-row fill
+          # We can be greedy, just do one big mult-row fill. Only when the
+          # window spans full rows, or the fill would cross the clip.
           let
             start = image.dataIndex(0, y)
             len = image.dataIndex(0, y + partitionHeight) - start
@@ -1670,7 +1713,10 @@ proc fillShapes(
           for r in 0 ..< partitionHeight:
             hits[0] = (cast[Fixed32](minX * 256), 1.int16)
             hits[1] = (cast[Fixed32](maxX * 256), -1.int16)
-            image.fillHits(rgbx, 0, y + r, hits, 2, NonZero, blendMode)
+            image.fillHits(
+              rgbx, 0, y + r, hits, 2, NonZero, blendMode,
+              window.minX, window.maxX
+            )
 
         y += partitionHeight
         continue
@@ -1796,7 +1842,7 @@ proc fillShapes(
                   pen = rectStart
                 prevPenY = penY
                 penY = left.solveY(pen)
-                if x < 0 or x >= image.width:
+                if x < window.minX or x >= window.maxX:
                   continue
                 let
                   run = pen - prevPen
@@ -1834,7 +1880,7 @@ proc fillShapes(
                   pen = sliverEnd
                 prevPenY = penY
                 penY = right.solveY(pen)
-                if x < 0 or x >= image.width:
+                if x < window.minX or x >= window.maxX:
                   continue
                 let
                   run = pen - prevPen
@@ -1855,18 +1901,21 @@ proc fillShapes(
                 image.data[dataIndex] = blender(backdrop, source)
 
             let
-              fillBegin = leftCoverEnd.clamp(0, image.width)
-              fillEnd = rightCoverBegin.clamp(0, image.width)
+              fillBegin = leftCoverEnd.clamp(window.minX, window.maxX)
+              fillEnd = rightCoverBegin.clamp(window.minX, window.maxX)
             hits[0] = (fixed32(fillBegin.float32), 1.int16)
             hits[1] = (fixed32(fillEnd.float32), -1.int16)
-            image.fillHits(rgbx, 0, y, hits, 2, NonZero, blendMode, false)
+            image.fillHits(
+              rgbx, 0, y, hits, 2, NonZero, blendMode,
+              window.minX, window.maxX, false
+            )
 
             if blendMode == MaskBlend:
               let clearTo = min(trapLeft.at.x, trapLeft.to.x).int
               image.clearUnsafe(
-                min(filledTo, image.width),
+                clamp(filledTo, window.minX, window.maxX),
                 y,
-                min(clearTo, image.width),
+                clamp(clearTo, window.minX, window.maxX),
                 y
               )
 
@@ -1874,7 +1923,9 @@ proc fillShapes(
             i += 2
 
           if blendMode == MaskBlend:
-            image.clearUnsafe(min(filledTo, image.width), y, image.width, y)
+            image.clearUnsafe(
+              clamp(filledTo, window.minX, window.maxX), y, window.maxX, y
+            )
 
           inc y
           continue
@@ -1883,7 +1934,7 @@ proc fillShapes(
       cast[ptr UncheckedArray[uint8]](coverages[0].addr),
       hits,
       numHits,
-      image.width,
+      window.maxX,
       y,
       startX,
       partitions,
@@ -1910,14 +1961,16 @@ proc fillShapes(
         hits,
         numHits,
         windingRule,
-        blendMode
+        blendMode,
+        window.minX,
+        window.maxX
       )
 
     inc y
 
   if blendMode == MaskBlend:
-    image.clearUnsafe(0, 0, 0, startY)
-    image.clearUnsafe(0, pathHeight, 0, image.height)
+    image.clearUnsafe(window.minX, window.minY, window.minX, startY)
+    image.clearUnsafe(window.minX, pathHeight, window.minX, window.maxY)
 
 proc miterLimitToAngle*(limit: float32): float32 {.inline.} =
   ## Converts miter-limit-ratio to miter-limit-angle.
@@ -2103,8 +2156,11 @@ proc fillPath*(
   path: SomePath,
   paint: Paint,
   transform = mat3(),
-  windingRule = NonZero
+  windingRule = NonZero,
+  clip = rect(0, 0, 0, 0)
 ) {.raises: [PixieError].} =
+  ## Fills a path. `clip`, when it has a non-zero size, bounds the pixels that
+  ## may be written; a zero-size clip means unclipped.
   ## Fills a path.
   paint.opacity = clamp(paint.opacity, 0, 1)
 
@@ -2117,7 +2173,7 @@ proc fillPath*(
       shapes.transform(transform)
       var color = paint.color
       color.a *= paint.opacity
-      image.fillShapes(shapes, color, windingRule, paint.blendMode)
+      image.fillShapes(shapes, color, windingRule, paint.blendMode, clip)
     return
 
   let
@@ -2158,8 +2214,11 @@ proc strokePath*(
   lineCap = ButtCap,
   lineJoin = MiterJoin,
   miterLimit = defaultMiterLimit,
-  dashes: seq[float32] = @[]
+  dashes: seq[float32] = @[],
+  clip = rect(0, 0, 0, 0)
 ) {.raises: [PixieError].} =
+  ## Strokes a path. `clip`, when it has a non-zero size, bounds the pixels that
+  ## may be written; a zero-size clip means unclipped.
   ## Strokes a path.
   paint.opacity = clamp(paint.opacity, 0, 1)
 
@@ -2180,7 +2239,7 @@ proc strokePath*(
       strokeShapes.transform(transform)
       var color = paint.color
       color.a *= paint.opacity
-      image.fillShapes(strokeShapes, color, NonZero, paint.blendMode)
+      image.fillShapes(strokeShapes, color, NonZero, paint.blendMode, clip)
     return
 
   let

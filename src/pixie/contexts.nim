@@ -186,7 +186,9 @@ proc newFont(ctx: Context): Font =
   result = newFont(ctx.typefaces.getOrDefault(ctx.font, nil))
   result.size = ctx.fontSize
 
-proc fillText(ctx: Context, image: Image, text: string, at: Vec2) =
+proc fillText(
+  ctx: Context, image: Image, text: string, at: Vec2, clip: Rect
+) =
   let font = newFont(ctx)
 
   # Canvas positions text relative to the alphabetic baseline by default
@@ -220,7 +222,8 @@ proc fillText(ctx: Context, image: Image, text: string, at: Vec2) =
     font,
     text,
     ctx.mat * translate(at),
-    hAlign = ctx.textAlign
+    hAlign = ctx.textAlign,
+    clip = clip
   )
 
   if ctx.globalAlpha != 1:
@@ -466,24 +469,27 @@ proc strokeRect*(
   ## strokeStyle and other context settings.
   ctx.strokeRect(rect(x, y, width, height))
 
-proc fillText*(ctx: Context, text: string, at: Vec2) {.raises: [PixieError].} =
+proc fillText*(
+  ctx: Context, text: string, at: Vec2, clip = rect(0, 0, 0, 0)
+) {.raises: [PixieError].} =
   ## Draws a text string at the specified coordinates, filling the string's
-  ## characters with the current fillStyle
+  ## characters with the current fillStyle. `clip`, when it has a non-zero size,
+  ## bounds the pixels that may be written; a zero-size clip means unclipped.
   if ctx.mask != nil and ctx.layer == nil:
     ctx.saveLayer()
-    ctx.fillText(ctx.layer, text, at)
+    ctx.fillText(ctx.layer, text, at, clip)
     ctx.restore()
   elif ctx.layer != nil:
-    ctx.fillText(ctx.layer, text, at)
+    ctx.fillText(ctx.layer, text, at, clip)
   else:
-    ctx.fillText(ctx.image, text, at)
+    ctx.fillText(ctx.image, text, at, clip)
 
 proc fillText*(
-  ctx: Context, text: string, x, y: float32
+  ctx: Context, text: string, x, y: float32, clip = rect(0, 0, 0, 0)
 ) {.inline, raises: [PixieError].} =
   ## Draws a text string at the specified coordinates, filling the string's
   ## characters with the current fillStyle
-  ctx.fillText(text, vec2(x, y))
+  ctx.fillText(text, vec2(x, y), clip)
 
 proc strokeText*(ctx: Context, text: string, at: Vec2) {.raises: [PixieError].} =
   ## Draws the outlines of the characters of a text string at the specified

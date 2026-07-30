@@ -575,7 +575,8 @@ proc textUber(
   lineJoin = MiterJoin,
   miterLimit = defaultMiterLimit,
   dashes: seq[float32] = @[],
-  stroke: static[bool] = false
+  stroke: static[bool] = false,
+  clip = rect(0, 0, 0, 0)
 ) =
   let spanPaths = arrangement.computePaths()
   for spanIndex in 0 ..< arrangement.spans.len:
@@ -591,12 +592,13 @@ proc textUber(
           lineCap,
           lineJoin,
           miterLimit,
-          dashes
+          dashes,
+          clip
         )
     else:
       let font = arrangement.fonts[spanIndex]
       for paint in font.paints:
-        target.fillPath(path, paint, transform)
+        target.fillPath(path, paint, transform, NonZero, clip)
 
 proc computeBounds*(
   arrangement: Arrangement,
@@ -611,13 +613,19 @@ proc computeBounds*(
 proc fillText*(
   target: Image,
   arrangement: Arrangement,
-  transform = mat3()
+  transform = mat3(),
+  clip = rect(0, 0, 0, 0)
 ) {.inline, raises: [PixieError].} =
-  ## Fills the text arrangement.
+  ## Fills the text arrangement. `clip`, when it has a non-zero size, bounds the
+  ## pixels that may be written; a zero-size clip means unclipped.
+  ##
+  ## The arrangement is rasterized as given, so a clipped run keeps the shaping
+  ## it was typeset with.
   textUber(
     target,
     arrangement,
-    transform
+    transform,
+    clip = clip
   )
 
 proc fillText*(
@@ -627,14 +635,16 @@ proc fillText*(
   transform = mat3(),
   bounds = vec2(0, 0),
   hAlign = LeftAlign,
-  vAlign = TopAlign
+  vAlign = TopAlign,
+  clip = rect(0, 0, 0, 0)
 ) {.inline, raises: [PixieError].} =
   ## Typesets and fills the text. Optional parameters:
   ## transform: translation or matrix to apply
   ## bounds: width determines wrapping and hAlign, height for vAlign
   ## hAlign: horizontal alignment of the text
   ## vAlign: vertical alignment of the text
-  fillText(target, font.typeset(text, bounds, hAlign, vAlign), transform)
+  ## clip: when non-zero in size, bounds the pixels that may be written
+  fillText(target, font.typeset(text, bounds, hAlign, vAlign), transform, clip)
 
 proc strokeText*(
   target: Image,
