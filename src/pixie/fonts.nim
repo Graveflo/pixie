@@ -2,6 +2,9 @@ import bumpy, chroma, common, os, fontformats/opentype,
     fontformats/svgfont, images, paints, paths,
     strutils, unicode, vmath
 
+when defined(nimPreviewSlimSystem):
+  import std/[syncio]
+
 const
   autoLineHeight*: float32 = -1 ## Use default line height for the font size
   LF = Rune(10)

@@ -1,6 +1,9 @@
 import blends, bumpy, chroma, common, images, internal, paints, simd, std/fenv,
     std/strutils, vmath
 
+when defined(nimPreviewSlimSystem):
+  import std/[formatfloat]
+
 type
   WindingRule* = enum
     ## Winding rules.

@@ -7,6 +7,9 @@ import
 export bumpy, chroma, common, contexts, fonts, imagebase64, images, paints,
     paths, vmath
 
+when defined(nimPreviewSlimSystem):
+  import std/[syncio]
+
 type
   FileFormat* = enum
     PngFormat, BmpFormat, JpegFormat, GifFormat, QoiFormat, PpmFormat,
