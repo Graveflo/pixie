@@ -1,4 +1,4 @@
-import bumpy, chroma, common, os, fontformats/opentype,
+import bumpy, chroma, common, os, std/options, fontformats/opentype,
     fontformats/svgfont, images, paints, paths,
     strutils, unicode, vmath
 
@@ -572,7 +572,8 @@ proc textUber(
   lineJoin = MiterJoin,
   miterLimit = defaultMiterLimit,
   dashes: seq[float32] = @[],
-  stroke: static[bool] = false
+  stroke: static[bool] = false,
+  clip = none(Rect)
 ) =
   let spanPaths = arrangement.computePaths()
   for spanIndex in 0 ..< arrangement.spans.len:
@@ -588,12 +589,13 @@ proc textUber(
           lineCap,
           lineJoin,
           miterLimit,
-          dashes
+          dashes,
+          clip
         )
     else:
       let font = arrangement.fonts[spanIndex]
       for paint in font.paints:
-        target.fillPath(path, paint, transform)
+        target.fillPath(path, paint, transform, NonZero, clip)
 
 proc computeBounds*(
   arrangement: Arrangement,
@@ -608,13 +610,16 @@ proc computeBounds*(
 proc fillText*(
   target: Image,
   arrangement: Arrangement,
-  transform = mat3()
+  transform = mat3(),
+  clip = none(Rect)
 ) {.inline, raises: [PixieError].} =
-  ## Fills the text arrangement.
+  ## Fills the text arrangement without modifying pixels outside the
+  ## image-space clip.
   textUber(
     target,
     arrangement,
-    transform
+    transform,
+    clip = clip
   )
 
 proc fillText*(
@@ -624,14 +629,16 @@ proc fillText*(
   transform = mat3(),
   bounds = vec2(0, 0),
   hAlign = LeftAlign,
-  vAlign = TopAlign
+  vAlign = TopAlign,
+  clip = none(Rect)
 ) {.inline, raises: [PixieError].} =
   ## Typesets and fills the text. Optional parameters:
   ## transform: translation or matrix to apply
   ## bounds: width determines wrapping and hAlign, height for vAlign
   ## hAlign: horizontal alignment of the text
   ## vAlign: vertical alignment of the text
-  fillText(target, font.typeset(text, bounds, hAlign, vAlign), transform)
+  ## clip: no pixel outside it is modified; omit it to fill unclipped
+  fillText(target, font.typeset(text, bounds, hAlign, vAlign), transform, clip)
 
 proc strokeText*(
   target: Image,

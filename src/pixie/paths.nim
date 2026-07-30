@@ -1,7 +1,10 @@
 import blends, bumpy, chroma, common, images, internal, paints, simd, std/fenv,
-    std/strutils, vmath
+    std/options, std/strutils, vmath
 
 type
+  RasterWindow = tuple[minX, minY, maxX, maxY: int]
+    ## Half-open image-space bounds a fill may write.
+
   WindingRule* = enum
     ## Winding rules.
     NonZero
@@ -1352,7 +1355,7 @@ proc computeCoverage(
   hits: var seq[(Fixed32, int16)],
   numHits: var int,
   width: int,
-  y, startX: int,
+  y, startX, coverageLen: int,
   partitions: var seq[Partition],
   partitionIndex: int,
   entryIndices: seq[int],
@@ -1400,18 +1403,26 @@ proc computeCoverage(
               at - prevAt
         if leftCover != 0:
           inc fillStart
-          coverages[prevAt.integer - startX] +=
-            (leftCover * sampleCoverage.int32).integer.uint8
+          # Hits outside the raster window still affect winding.
+          let leftIndex = prevAt.integer - startX
+          if leftIndex >= 0 and leftIndex < coverageLen:
+            coverages[leftIndex] +=
+              (leftCover * sampleCoverage.int32).integer.uint8
 
         if pixelCrossed:
           let rightCover = at - at.trunc
           if rightCover > 0:
-            coverages[at.integer - startX] +=
-              (rightCover * sampleCoverage.int32).integer.uint8
+            let rightIndex = at.integer - startX
+            if rightIndex >= 0 and rightIndex < coverageLen:
+              coverages[rightIndex] +=
+                (rightCover * sampleCoverage.int32).integer.uint8
 
-        let fillLen = at.integer - fillStart
+        let
+          spanStart = max(fillStart, startX)
+          spanEnd = min(at.integer, startX + coverageLen)
+          fillLen = spanEnd - spanStart
         if fillLen > 0:
-          var i = fillStart
+          var i = spanStart
           when allowSimd:
             when defined(amd64):
               let sampleCoverageVec = mm_set1_epi8(sampleCoverage)
@@ -1427,7 +1438,7 @@ proc computeCoverage(
                 coverageVec = vaddq_u8(coverageVec, sampleCoverageVec)
                 vst1q_u8(coverages[i - startX].addr, coverageVec)
                 i += 16
-          for j in i ..< fillStart + fillLen:
+          for j in i ..< spanEnd:
             coverages[j - startX] += sampleCoverage
 
 proc clearUnsafe(image: Image, startX, startY, toX, toY: int) =
@@ -1481,7 +1492,8 @@ proc fillCoverage(
   rgbx: ColorRGBX,
   startX, y: int,
   coverages: seq[uint8],
-  blendMode: BlendMode
+  blendMode: BlendMode,
+  clipMinX, clipMaxX: int
 ) =
   var
     x = startX
@@ -1513,8 +1525,8 @@ proc fillCoverage(
       coverages.len
     )
 
-    image.clearUnsafe(0, y, startX, y)
-    image.clearUnsafe(startX + coverages.len, y, image.width, y)
+    image.clearUnsafe(clipMinX, y, max(startX, clipMinX), y)
+    image.clearUnsafe(min(startX + coverages.len, clipMaxX), y, clipMaxX, y)
 
   else:
     let blender = blendMode.blender()
@@ -1537,6 +1549,20 @@ proc blendLineMask(
   for i in 0 ..< len:
     line[i] = blendMask(line[i], rgbx)
 
+iterator walkIntegerClipped(
+  hits: seq[(Fixed32, int16)],
+  numHits: int,
+  windingRule: WindingRule,
+  y, clipMinX, clipMaxX: int
+): (int, int) =
+  ## Spans of a scanline that are both inside the path and inside the clip.
+  for (start, len) in hits.walkInteger(numHits, windingRule, y, clipMaxX):
+    let
+      clippedStart = max(start, clipMinX)
+      clippedLen = start + len - clippedStart
+    if clippedLen > 0:
+      yield (clippedStart, clippedLen)
+
 proc fillHits(
   image: Image,
   rgbx: ColorRGBX,
@@ -1545,15 +1571,20 @@ proc fillHits(
   numHits: int,
   windingRule: WindingRule,
   blendMode: BlendMode,
+  clipMinX, clipMaxX: int,
   maskClears = true
 ) =
   case blendMode:
   of OverwriteBlend:
-    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+    for (start, len) in hits.walkIntegerClipped(
+      numHits, windingRule, y, clipMinX, clipMaxX
+    ):
       fillUnsafe(image.data, rgbx, image.dataIndex(start, y), len)
 
   of NormalBlend:
-    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+    for (start, len) in hits.walkIntegerClipped(
+      numHits, windingRule, y, clipMinX, clipMaxX
+    ):
       if rgbx.a == 255:
         fillUnsafe(image.data, rgbx, image.dataIndex(start, y), len)
       else:
@@ -1561,8 +1592,10 @@ proc fillHits(
 
   of MaskBlend:
     {.linearScanEnd.}
-    var filledTo = startX
-    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+    var filledTo = max(startX, clipMinX)
+    for (start, len) in hits.walkIntegerClipped(
+      numHits, windingRule, y, clipMinX, clipMaxX
+    ):
       if maskClears: # Clear any gap between this fill and the previous fill
         let gapBetween = start - filledTo
         if gapBetween > 0:
@@ -1578,41 +1611,71 @@ proc fillHits(
         filledTo = start + len
 
     if maskClears:
-      image.clearUnsafe(0, y, startX, y)
-      image.clearUnsafe(filledTo, y, image.width, y)
+      image.clearUnsafe(clipMinX, y, max(startX, clipMinX), y)
+      image.clearUnsafe(filledTo, y, clipMaxX, y)
 
   else:
     let blender = blendMode.blender()
-    for (start, len) in hits.walkInteger(numHits, windingRule, y, image.width):
+    for (start, len) in hits.walkIntegerClipped(
+      numHits, windingRule, y, clipMinX, clipMaxX
+    ):
       var dataIndex = image.dataIndex(start, y)
       for _ in 0 ..< len:
         let backdrop = image.data[dataIndex]
         image.data[dataIndex] = blender(backdrop, rgbx)
         inc dataIndex
 
+proc clipWindow(image: Image, clip: Option[Rect]): RasterWindow =
+  ## Intersects the image with a clip snapped to whole pixels.
+  if clip.isNone:
+    result = (0, 0, image.width, image.height)
+  elif clip.unsafeGet.w <= 0 or clip.unsafeGet.h <= 0:
+    result = (0, 0, 0, 0)
+  else:
+    let snapped = clip.unsafeGet.snapToPixels()
+    result = (
+      clamp(snapped.x.int, 0, image.width),
+      clamp(snapped.y.int, 0, image.height),
+      max(clamp(snapped.x.int, 0, image.width),
+          clamp((snapped.x + snapped.w).int, 0, image.width)),
+      max(clamp(snapped.y.int, 0, image.height),
+          clamp((snapped.y + snapped.h).int, 0, image.height))
+    )
+
+proc isEmpty(window: RasterWindow): bool =
+  window.maxX <= window.minX or window.maxY <= window.minY
+
 proc fillShapes(
   image: Image,
   shapes: seq[Polygon],
   color: SomeColor,
   windingRule: WindingRule,
-  blendMode: BlendMode
+  blendMode: BlendMode,
+  clip = none(Rect)
 ) =
-  # Figure out the total bounds of all the shapes,
-  # rasterize only within the total bounds
+  # Rasterize within the intersection of the path, clip and image.
   let
     rgbx = color.asRgbx()
     segments = shapes.shapesToSegments()
     bounds = computeBounds(segments).snapToPixels()
-    startX = max(0, bounds.x.int)
-    startY = max(0, bounds.y.int)
-    pathWidth =
-      if startX < image.width:
-        min(bounds.w.int, image.width - startX)
-      else:
-        0
-    pathHeight = min(image.height, (bounds.y + bounds.h).int)
+    window = image.clipWindow(clip)
+
+  if window.isEmpty:
+    return
+
+  # Full-width windows avoid per-span clamp overhead.
+  let
+    inset = window.minX != 0 or window.maxX != image.width
+    startX = max(window.minX, bounds.x.int)
+    startY = clamp(bounds.y.int, window.minY, window.maxY)
+    pathRight = (bounds.x + bounds.w).int
+    pathWidth = max(0, min(pathRight, window.maxX) - startX)
+    pathHeight = clamp((bounds.y + bounds.h).int, window.minY, window.maxY)
 
   if pathWidth == 0:
+    if blendMode == MaskBlend:
+      # An empty mask fill clears the raster window.
+      image.clearUnsafe(window.minX, window.minY, window.minX, window.maxY)
     return
 
   if pathWidth < 0:
@@ -1647,13 +1710,13 @@ proc fillShapes(
         let
           left = partition.entries[0].segment.at.x.int
           right = partition.entries[1].segment.at.x.int
-          minX = left.clamp(0, image.width)
-          maxX = right.clamp(0, image.width)
+          minX = left.clamp(window.minX, window.maxX)
+          maxX = right.clamp(window.minX, window.maxX)
           skipBlending =
             blendMode == OverwriteBlend or
             (blendMode == NormalBlend and rgbx.a == 255)
         if skipBlending and minX == 0 and maxX == image.width:
-          # We can be greedy, just do one big mult-row fill
+          # Full rows can be filled as one contiguous span.
           let
             start = image.dataIndex(0, y)
             len = image.dataIndex(0, y + partitionHeight) - start
@@ -1662,7 +1725,10 @@ proc fillShapes(
           for r in 0 ..< partitionHeight:
             hits[0] = (cast[Fixed32](minX * 256), 1.int16)
             hits[1] = (cast[Fixed32](maxX * 256), -1.int16)
-            image.fillHits(rgbx, 0, y + r, hits, 2, NonZero, blendMode)
+            image.fillHits(
+              rgbx, 0, y + r, hits, 2, NonZero, blendMode,
+              window.minX, window.maxX
+            )
 
         y += partitionHeight
         continue
@@ -1788,7 +1854,7 @@ proc fillShapes(
                   pen = rectStart
                 prevPenY = penY
                 penY = left.solveY(pen)
-                if x < 0 or x >= image.width:
+                if x < window.minX or x >= window.maxX:
                   continue
                 let
                   run = pen - prevPen
@@ -1826,7 +1892,7 @@ proc fillShapes(
                   pen = sliverEnd
                 prevPenY = penY
                 penY = right.solveY(pen)
-                if x < 0 or x >= image.width:
+                if x < window.minX or x >= window.maxX:
                   continue
                 let
                   run = pen - prevPen
@@ -1847,26 +1913,37 @@ proc fillShapes(
                 image.data[dataIndex] = blender(backdrop, source)
 
             let
-              fillBegin = leftCoverEnd.clamp(0, image.width)
-              fillEnd = rightCoverBegin.clamp(0, image.width)
+              fillBegin = leftCoverEnd.clamp(window.minX, window.maxX)
+              fillEnd = rightCoverBegin.clamp(window.minX, window.maxX)
             hits[0] = (fixed32(fillBegin.float32), 1.int16)
             hits[1] = (fixed32(fillEnd.float32), -1.int16)
-            image.fillHits(rgbx, 0, y, hits, 2, NonZero, blendMode, false)
+            image.fillHits(
+              rgbx, 0, y, hits, 2, NonZero, blendMode,
+              window.minX, window.maxX, false
+            )
 
             if blendMode == MaskBlend:
               let clearTo = min(trapLeft.at.x, trapLeft.to.x).int
-              image.clearUnsafe(
-                min(filledTo, image.width),
-                y,
-                min(clearTo, image.width),
-                y
-              )
+              if inset:
+                image.clearUnsafe(
+                  clamp(filledTo, window.minX, window.maxX),
+                  y,
+                  clamp(clearTo, window.minX, window.maxX),
+                  y
+                )
+              else:
+                image.clearUnsafe(filledTo, y, clearTo, y)
 
             filledTo = max(trapRight.at.x, trapRight.to.x).ceil.int
             i += 2
 
           if blendMode == MaskBlend:
-            image.clearUnsafe(min(filledTo, image.width), y, image.width, y)
+            if inset:
+              image.clearUnsafe(
+                clamp(filledTo, window.minX, window.maxX), y, window.maxX, y
+              )
+            else:
+              image.clearUnsafe(filledTo, y, window.maxX, y)
 
           inc y
           continue
@@ -1875,9 +1952,10 @@ proc fillShapes(
       cast[ptr UncheckedArray[uint8]](coverages[0].addr),
       hits,
       numHits,
-      image.width,
+      window.maxX,
       y,
       startX,
+      pathWidth,
       partitions,
       partitionIndex,
       entryIndices,
@@ -1891,7 +1969,9 @@ proc fillShapes(
         startX,
         y,
         coverages,
-        blendMode
+        blendMode,
+        window.minX,
+        window.maxX
       )
       zeroMem(coverages[0].addr, coverages.len)
     else:
@@ -1902,14 +1982,23 @@ proc fillShapes(
         hits,
         numHits,
         windingRule,
-        blendMode
+        blendMode,
+        window.minX,
+        window.maxX
       )
 
     inc y
 
   if blendMode == MaskBlend:
-    image.clearUnsafe(0, 0, 0, startY)
-    image.clearUnsafe(0, pathHeight, 0, image.height)
+    # Clear uncovered rows without crossing inset window edges.
+    if window.minX == 0 and window.maxX == image.width:
+      image.clearUnsafe(0, window.minY, 0, startY)
+      image.clearUnsafe(0, pathHeight, 0, window.maxY)
+    else:
+      for y in window.minY ..< startY:
+        image.clearUnsafe(window.minX, y, window.maxX, y)
+      for y in pathHeight ..< window.maxY:
+        image.clearUnsafe(window.minX, y, window.maxX, y)
 
 proc miterLimitToAngle*(limit: float32): float32 {.inline.} =
   ## Converts miter-limit-ratio to miter-limit-angle.
@@ -2090,14 +2179,25 @@ proc parseSomePath(
   elif type(path) is Path:
     path.commandsToShapes(closeSubpaths, pixelScale)
 
+proc paintWindow(image: Image, clip: Option[Rect]): tuple[x, y, w, h: int] =
+  ## Returns image-space bounds for non-solid paint intermediates.
+  let window = image.clipWindow(clip)
+  result = (
+    window.minX,
+    window.minY,
+    max(0, window.maxX - window.minX),
+    max(0, window.maxY - window.minY)
+  )
+
 proc fillPath*(
   image: Image,
   path: SomePath,
   paint: Paint,
   transform = mat3(),
-  windingRule = NonZero
+  windingRule = NonZero,
+  clip = none(Rect)
 ) {.raises: [PixieError].} =
-  ## Fills a path.
+  ## Fills a path without modifying pixels outside the image-space clip.
   paint.opacity = clamp(paint.opacity, 0, 1)
 
   if paint.opacity == 0:
@@ -2109,14 +2209,19 @@ proc fillPath*(
       shapes.transform(transform)
       var color = paint.color
       color.a *= paint.opacity
-      image.fillShapes(shapes, color, windingRule, paint.blendMode)
+      image.fillShapes(shapes, color, windingRule, paint.blendMode, clip)
+    return
+
+  let win = image.paintWindow(clip)
+  if win.w == 0 or win.h == 0:
     return
 
   let
-    mask = newImage(image.width, image.height)
-    fill = newImage(image.width, image.height)
+    mask = newImage(win.w, win.h)
+    fill = newImage(win.w, win.h)
+    toWindow = translate(vec2(-win.x.float32, -win.y.float32))
 
-  mask.fillPath(path, color(1, 1, 1, 1), transform, windingRule)
+  mask.fillPath(path, color(1, 1, 1, 1), toWindow * transform, windingRule)
 
   # Draw the image (maybe tiled) or gradients. Do this with opaque paint and
   # and then apply the paint's opacity to the mask.
@@ -2127,11 +2232,21 @@ proc fillPath*(
     of SolidPaint:
       discard # Handled above
     of ImagePaint:
-      fill.draw(paint.image, paint.imageMat)
+      fill.draw(paint.image, toWindow * paint.imageMat)
     of TiledImagePaint:
-      fill.drawTiled(paint.image, paint.imageMat)
+      fill.drawTiled(paint.image, toWindow * paint.imageMat)
     of LinearGradientPaint, RadialGradientPaint, AngularGradientPaint:
-      fill.fillGradient(paint)
+      # Shift image-space handles into the intermediate.
+      if win.x == 0 and win.y == 0:
+        fill.fillGradient(paint)
+      else:
+        let shifted = paint.copy()
+        shifted.gradientHandlePositions = @[]
+        for handle in paint.gradientHandlePositions:
+          shifted.gradientHandlePositions.add(
+            vec2(handle.x - win.x.float32, handle.y - win.y.float32)
+          )
+        fill.fillGradient(shifted)
 
   paint.opacity = savedOpacity
 
@@ -2139,7 +2254,8 @@ proc fillPath*(
     mask.applyOpacity(paint.opacity)
 
   fill.draw(mask, blendMode = MaskBlend)
-  image.draw(fill, blendMode = paint.blendMode)
+  image.draw(fill, translate(vec2(win.x.float32, win.y.float32)),
+    blendMode = paint.blendMode)
 
 proc strokePath*(
   image: Image,
@@ -2150,9 +2266,10 @@ proc strokePath*(
   lineCap = ButtCap,
   lineJoin = MiterJoin,
   miterLimit = defaultMiterLimit,
-  dashes: seq[float32] = @[]
+  dashes: seq[float32] = @[],
+  clip = none(Rect)
 ) {.raises: [PixieError].} =
-  ## Strokes a path.
+  ## Strokes a path without modifying pixels outside the image-space clip.
   paint.opacity = clamp(paint.opacity, 0, 1)
 
   if paint.opacity == 0:
@@ -2172,17 +2289,22 @@ proc strokePath*(
       strokeShapes.transform(transform)
       var color = paint.color
       color.a *= paint.opacity
-      image.fillShapes(strokeShapes, color, NonZero, paint.blendMode)
+      image.fillShapes(strokeShapes, color, NonZero, paint.blendMode, clip)
+    return
+
+  let win = image.paintWindow(clip)
+  if win.w == 0 or win.h == 0:
     return
 
   let
-    mask = newImage(image.width, image.height)
-    fill = newImage(image.width, image.height)
+    mask = newImage(win.w, win.h)
+    fill = newImage(win.w, win.h)
+    toWindow = translate(vec2(-win.x.float32, -win.y.float32))
 
   mask.strokePath(
     path,
     color(1, 1, 1, 1),
-    transform,
+    toWindow * transform,
     strokeWidth,
     lineCap,
     lineJoin,
@@ -2199,11 +2321,21 @@ proc strokePath*(
     of SolidPaint:
       discard # Handled above
     of ImagePaint:
-      fill.draw(paint.image, paint.imageMat)
+      fill.draw(paint.image, toWindow * paint.imageMat)
     of TiledImagePaint:
-      fill.drawTiled(paint.image, paint.imageMat)
+      fill.drawTiled(paint.image, toWindow * paint.imageMat)
     of LinearGradientPaint, RadialGradientPaint, AngularGradientPaint:
-      fill.fillGradient(paint)
+      # Shift image-space handles into the intermediate.
+      if win.x == 0 and win.y == 0:
+        fill.fillGradient(paint)
+      else:
+        let shifted = paint.copy()
+        shifted.gradientHandlePositions = @[]
+        for handle in paint.gradientHandlePositions:
+          shifted.gradientHandlePositions.add(
+            vec2(handle.x - win.x.float32, handle.y - win.y.float32)
+          )
+        fill.fillGradient(shifted)
 
   paint.opacity = savedOpacity
 
@@ -2211,7 +2343,8 @@ proc strokePath*(
     mask.applyOpacity(paint.opacity)
 
   fill.draw(mask, blendMode = MaskBlend)
-  image.draw(fill, blendMode = paint.blendMode)
+  image.draw(fill, translate(vec2(win.x.float32, win.y.float32)),
+    blendMode = paint.blendMode)
 
 proc overlaps(
   shapes: seq[Polygon],
